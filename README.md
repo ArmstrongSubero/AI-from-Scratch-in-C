@@ -1,6 +1,6 @@
 # AI from Scratch in C
 
-This repository contains the source code for *AI from Scratch in C*, and is the
+This repository contains the source code for *AI from Scratch in C: From Perceptrons to Large Language Models*, and is the
 official code repository for the book.
 
 
