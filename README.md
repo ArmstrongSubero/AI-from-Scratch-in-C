@@ -21,10 +21,10 @@ frameworks stop being magic.
 
 * [Read the book free online](https://rvembedded.com/books/ai-from-scratch-in-c/)
 * [Book page](https://rvembedded.com/products/ai-from-scratch-in-c/)
-* [Get the complete PDF edition](https://payhip.com/b/tCp42) (Use code LAUNCHMONTH to get the book for $29 until September 30th!)
+* [Get the complete PDF edition](https://payhip.com/b/tCp42) (Use code LAUNCHMONTH to get the book for $29 until September 30th 2026!)
 
 
-*Exclusive Chapters 38 to 45 on the DeepSeek architecture including deployment in production ship in October as a free update for early supporters!
+*Chapters 38 to 45 cover the DeepSeek architecture including deployment in production and ship in October 2026. They are included in the PDF edition only.
 
 <br>
 
