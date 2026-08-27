@@ -23,6 +23,9 @@ frameworks stop being magic.
 * [Book page](https://rvembedded.com/products/ai-from-scratch-in-c/)
 * [Get the complete PDF edition](https://payhip.com/b/tCp42) (Use code LAUNCHMONTH to get the book for $29 until September 30th!)
 
+
+*Exclusive Chapters 38 to 45 on the DeepSeek architecture including deployment in production ship in October as a free update for early supporters!
+
 <br>
 
 To download a copy of this repository, click the Download ZIP button or run the
