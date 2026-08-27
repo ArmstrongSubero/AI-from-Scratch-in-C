@@ -4,7 +4,7 @@ This repository contains the source code for *AI from Scratch in C*, and is the
 official code repository for the book.
 
 
-<img width="1600" height="1974" alt="ai_in_c_cover" src="https://github.com/user-attachments/assets/c9b0baa3-4bc0-4baa-a2c7-bcbdd525b26a" />
+<img width="200" height="247" alt="ai_in_c_cover" src="https://github.com/user-attachments/assets/c9b0baa3-4bc0-4baa-a2c7-bcbdd525b26a" />
 
 
 
