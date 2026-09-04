@@ -1,10 +1,10 @@
 # AI from Scratch in C
 
-This repository contains the source code for *AI from Scratch in C*, and is the
+This repository contains the source code for *AI from Scratch in C: From Perceptrons to Large Language Models*, and is the
 official code repository for the book.
 
 
-<img width="1600" height="1974" alt="ai_in_c_cover" src="https://github.com/user-attachments/assets/c9b0baa3-4bc0-4baa-a2c7-bcbdd525b26a" />
+<img width="400" height="494" alt="ai_in_c_cover" src="https://github.com/user-attachments/assets/c9b0baa3-4bc0-4baa-a2c7-bcbdd525b26a" />
 
 
 
@@ -21,7 +21,10 @@ frameworks stop being magic.
 
 * [Read the book free online](https://rvembedded.com/books/ai-from-scratch-in-c/)
 * [Book page](https://rvembedded.com/products/ai-from-scratch-in-c/)
-* [Get the complete PDF edition](https://payhip.com/b/tCp42) (Use code LAUNCHMONTH to get the book for $29 until September 30th!)
+* [Get the complete PDF edition](https://payhip.com/b/tCp42) (Use code LAUNCHMONTH to get the book for $29 until September 30th 2026!)
+
+
+*Chapters 38 to 45 cover the DeepSeek architecture including deployment in production and ship in October 2026. They are included in the PDF edition only.
 
 <br>
 
