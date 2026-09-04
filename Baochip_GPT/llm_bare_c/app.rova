@@ -1,0 +1,1104 @@
+/*
+ * Copyright (c) 2026 Armstrong Subero
+ *
+ * Program:  GPT_Capstone (C style)
+ * Platform: Baochip-1x / Rovari SDK
+ * Hardware: none (UART2 console, on-chip RRAM, on-chip TRNG)
+ *
+ * A transformer that trains on the chip. Forward, backward,
+ * Adam, and a gradient check. ~1 MB SRAM, ~77 min for 100 epochs.
+ */
+
+#include "rovari.h"
+#include "hardware/rram.h"
+#include "hardware/trng.h"
+
+#include <string.h>
+#include <math.h>
+#include <stddef.h>
+
+/* 1 = seed 42, matches the PC build. 0 = seed from TRNG. */
+#define DETERMINISTIC_SEED  1
+
+#define VOCAB     28
+#define D_MODEL   32
+#define N_HEADS   4
+#define D_HEAD    8
+#define D_FF      128
+#define N_LAYERS  2
+#define MAX_SEQ   64
+
+#define WINDOW    48
+#define STRIDE    16
+#define EPOCHS    100
+
+#define WEIGHTS_ADDR  RRAM_USER_BASE
+#define WEIGHTS_MAGIC 0x4C4C4D31u   /* "LLM1" */
+
+/* Local _sbrk so libnosys sbrk.o is never pulled in. It wants an
+   `end` symbol link.ld does not define. extern "C" because the
+   build drives g++. */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+static char  heap_area[4096];
+static char *heap_ptr = heap_area;
+
+void *_sbrk(int incr)
+{
+    char *prev = heap_ptr;
+
+    if (incr < 0) return (void *)-1;
+
+    if (heap_ptr + incr > heap_area + sizeof(heap_area))
+        return (void *)-1;
+
+    heap_ptr += incr;
+    return prev;
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+/* ---- Printing ----------------------------------------------------
+ * mini_printf does bare %d %c %x %s only. No %f, and no width or
+ * flag specifiers, so %06d would silently print 0.017977 as
+ * 0.17977. Everything below builds a buffer and emits it as %s.
+ * ------------------------------------------------------------------ */
+
+/* Unsigned to decimal, zero padded to min_digits. */
+static void itoa_u(char **p, uint32_t v, int min_digits)
+{
+    char tmp[12];
+    int n = 0;
+
+    do
+    {
+        tmp[n++] = (char)('0' + (int)(v % 10u));
+        v /= 10u;
+    }
+    while (v && n < 11);
+
+    while (n < min_digits && n < 11) tmp[n++] = '0';
+    while (n > 0) *(*p)++ = tmp[--n];
+}
+
+/* Float to string, digit by digit. The half step before the split
+   is load bearing: without it float32 drift makes 0.017977 print
+   as 0.017976. */
+static void ftoa(char *buffer, float value, int precision)
+{
+    char *ptr = buffer;
+    float half = 0.5f;
+    uint32_t integer_part;
+    int i;
+
+    if (value < 0.0f)
+    {
+        *ptr++ = '-';
+        value = -value;
+    }
+
+    /* inf and nan */
+    if (!(value < 1.0e9f))
+    {
+        *ptr++ = 'b'; *ptr++ = 'i'; *ptr++ = 'g'; *ptr = '\0';
+        return;
+    }
+
+    for (i = 0; i < precision; i++) half *= 0.1f;
+    value += half;
+
+    integer_part = (uint32_t)value;
+    value -= (float)integer_part;
+
+    itoa_u(&ptr, integer_part, 1);
+
+    *ptr++ = '.';
+
+    for (i = 0; i < precision; i++)
+    {
+        int digit;
+        value *= 10.0f;
+        digit = (int)value;
+        if (digit > 9) digit = 9;
+        if (digit < 0) digit = 0;
+        *ptr++ = (char)(digit + '0');
+        value -= (float)digit;
+    }
+
+    *ptr = '\0';
+}
+
+static void print_f(float v)
+{
+    char buf[40];
+    ftoa(buf, v, 6);
+    mini_printf("%s", buf);
+}
+
+/* m.mme+xx, 3 sig figs. For the gradient check errors. */
+static void print_sci(float v)
+{
+    char buf[24];
+    char *p = buf;
+    int exp10 = 0;
+    int guard = 0;
+    uint32_t mant;
+
+    if (v < 0.0f)
+    {
+        *p++ = '-';
+        v = -v;
+    }
+
+    if (v == 0.0f || !(v < 1.0e30f))
+    {
+        mini_printf("0.00e+00");
+        return;
+    }
+
+    while (v >= 10.0f && guard++ < 60) { v /= 10.0f;  exp10++; }
+    while (v <  1.0f  && guard++ < 60) { v *= 10.0f;  exp10--; }
+
+    mant = (uint32_t)(v * 100.0f + 0.5f);
+
+    if (mant >= 1000u)
+    {
+        mant /= 10u;
+        exp10++;
+    }
+
+    itoa_u(&p, mant / 100u, 1);
+    *p++ = '.';
+    itoa_u(&p, mant % 100u, 2);
+    *p++ = 'e';
+    *p++ = (exp10 < 0) ? '-' : '+';
+    itoa_u(&p, (uint32_t)(exp10 < 0 ? -exp10 : exp10), 2);
+    *p = '\0';
+
+    mini_printf("%s", buf);
+}
+
+/* Left justified string. %-9s is not available. */
+static void print_pad(const char *s, int width)
+{
+    char buf[24];
+    char *p = buf;
+    int i = 0;
+
+    while (s[i] && i < 20) *p++ = s[i++];
+    while (i++ < width && (p - buf) < 23) *p++ = ' ';
+    *p = '\0';
+
+    mini_printf("%s", buf);
+}
+
+/* Right justified integer. %3d is not available. */
+static void print_iw(int v, int width)
+{
+    char buf[16];
+    char num[16];
+    char *p = buf;
+    char *q = num;
+    int len;
+
+    itoa_u(&q, (uint32_t)(v < 0 ? -v : v), 1);
+    *q = '\0';
+    len = (int)(q - num) + (v < 0 ? 1 : 0);
+
+    while (len++ < width && (p - buf) < 15) *p++ = ' ';
+    if (v < 0) *p++ = '-';
+
+    q = num;
+    while (*q && (p - buf) < 15) *p++ = *q++;
+    *p = '\0';
+
+    mini_printf("%s", buf);
+}
+
+/* ---- Model -------------------------------------------------------- */
+
+/* xorshift32, not libc rand(). rand() drags in malloc, and this is
+   bit identical to the PC build so both start from the same weights. */
+static uint32_t rng_state = 42u;
+
+static void rng_seed(uint32_t s)
+{
+    rng_state = s ? s : 42u;
+}
+
+static uint32_t rng_next(void)
+{
+    uint32_t x = rng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    rng_state = x;
+    return x;
+}
+
+static float randf(void)
+{
+    return (float)(rng_next() >> 8) / 16777216.0f;
+}
+
+static float gelu(float x)
+{
+    float u = 0.7978846f * (x + 0.044715f * x * x * x);
+    return 0.5f * x * (1.0f + tanhf(u));
+}
+
+static float gelu_grad(float x)
+{
+    float a = 0.044715f, c = 0.7978846f;
+    float u = c * (x + a * x * x * x);
+    float t = tanhf(u);
+    return 0.5f * (1.0f + t)
+         + 0.5f * x * (1.0f - t * t) * c
+           * (1.0f + 3.0f * a * x * x);
+}
+
+static int char_to_id(char c)
+{
+    if (c >= 'a' && c <= 'z') return c - 'a';
+    if (c == ' ') return 26;
+    return 27;
+}
+
+static char id_to_char(int id)
+{
+    if (id < 26) return (char)('a' + id);
+    if (id == 26) return ' ';
+    return '.';
+}
+
+static void softmax(float *x, int n)
+{
+    int i;
+    float mx = x[0], s = 0;
+    for (i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
+    for (i = 0; i < n; i++)
+    {
+        x[i] = expf(x[i] - mx);
+        s += x[i];
+    }
+    for (i = 0; i < n; i++) x[i] /= s;
+}
+
+typedef struct {
+    float tok_emb[VOCAB][D_MODEL];
+    float pos_emb[MAX_SEQ][D_MODEL];
+    float W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
+    float W_K[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
+    float W_V[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
+    float W_O[N_LAYERS][D_MODEL][D_MODEL];
+    float W_up[N_LAYERS][D_FF][D_MODEL];
+    float W_down[N_LAYERS][D_MODEL][D_FF];
+    float norm1_g[N_LAYERS][D_MODEL];
+    float norm2_g[N_LAYERS][D_MODEL];
+    float norm_f_g[D_MODEL];
+}
+GPT;
+
+#define NPARAM (sizeof(GPT) / sizeof(float))
+
+typedef struct {
+    int T;
+    int tok[MAX_SEQ];
+    float X0[MAX_SEQ][D_MODEL];
+    float Xa[N_LAYERS][MAX_SEQ][D_MODEL];
+    float n1[N_LAYERS][MAX_SEQ][D_MODEL];
+    float s1[N_LAYERS][MAX_SEQ];
+    float q[N_LAYERS][N_HEADS][MAX_SEQ][D_HEAD];
+    float k[N_LAYERS][N_HEADS][MAX_SEQ][D_HEAD];
+    float v[N_LAYERS][N_HEADS][MAX_SEQ][D_HEAD];
+    float p[N_LAYERS][N_HEADS][MAX_SEQ][MAX_SEQ];
+    float cc[N_LAYERS][MAX_SEQ][D_MODEL];
+    float Xb[N_LAYERS][MAX_SEQ][D_MODEL];
+    float n2[N_LAYERS][MAX_SEQ][D_MODEL];
+    float s2[N_LAYERS][MAX_SEQ];
+    float hf[N_LAYERS][MAX_SEQ][D_FF];
+    float gf[N_LAYERS][MAX_SEQ][D_FF];
+    float Xc[MAX_SEQ][D_MODEL];
+    float sf[MAX_SEQ];
+    float Xf[MAX_SEQ][D_MODEL];
+    float logit[MAX_SEQ][VOCAB];
+}
+Cache;
+
+static GPT   model;
+static Cache cache;
+static GPT   Grad, Mom, Vel;
+
+static void gpt_init(GPT *m)
+{
+    int i, l, d;
+    float *w = (float *)m;
+
+    for (i = 0; i < (int)NPARAM; i++)
+        w[i] = (randf() * 2 - 1) * 0.08f;
+
+    for (l = 0; l < N_LAYERS; l++)
+        for (d = 0; d < D_MODEL; d++)
+        {
+            m->norm1_g[l][d] = 1.0f;
+            m->norm2_g[l][d] = 1.0f;
+        }
+
+    for (d = 0; d < D_MODEL; d++)
+        m->norm_f_g[d] = 1.0f;
+}
+
+static float rmsnorm(const float *x, const float *g,
+                     float *y, int n)
+{
+    int i;
+    float ss = 0;
+    float s;
+
+    for (i = 0; i < n; i++) ss += x[i] * x[i];
+    s = 1.0f / sqrtf(ss / n + 1e-5f);
+    for (i = 0; i < n; i++) y[i] = g[i] * x[i] * s;
+    return s;
+}
+
+static void rmsnorm_back(const float *x, const float *g,
+                         float s, const float *dy,
+                         float *dx, float *dg, int n)
+{
+    int i;
+    float dot = 0;
+
+    for (i = 0; i < n; i++)
+    {
+        float xhat = x[i] * s;
+        dg[i] += dy[i] * xhat;
+        dot += dy[i] * g[i] * xhat;
+    }
+    dot /= n;
+    for (i = 0; i < n; i++)
+        dx[i] += s * (dy[i] * g[i] - x[i] * s * dot);
+}
+
+static void forward(const GPT *m, const int *tok, int T,
+                    Cache *c)
+{
+    int i, j, l, h, d, e;
+    static float X[MAX_SEQ][D_MODEL];
+
+    c->T = T;
+    for (i = 0; i < T; i++) c->tok[i] = tok[i];
+
+    for (i = 0; i < T; i++)
+        for (d = 0; d < D_MODEL; d++)
+            X[i][d] = c->X0[i][d] =
+                m->tok_emb[tok[i]][d] + m->pos_emb[i][d];
+
+    for (l = 0; l < N_LAYERS; l++)
+    {
+        memcpy(c->Xa[l], X, sizeof(X));
+
+        for (i = 0; i < T; i++)
+            c->s1[l][i] = rmsnorm(X[i], m->norm1_g[l],
+                                  c->n1[l][i], D_MODEL);
+
+        for (h = 0; h < N_HEADS; h++)
+        {
+            float scale;
+
+            for (i = 0; i < T; i++)
+                for (d = 0; d < D_HEAD; d++)
+                {
+                    float qa = 0, ka = 0, va = 0;
+                    for (e = 0; e < D_MODEL; e++)
+                    {
+                        float u = c->n1[l][i][e];
+                        qa += m->W_Q[l][h][d][e] * u;
+                        ka += m->W_K[l][h][d][e] * u;
+                        va += m->W_V[l][h][d][e] * u;
+                    }
+                    c->q[l][h][i][d] = qa;
+                    c->k[l][h][i][d] = ka;
+                    c->v[l][h][i][d] = va;
+                }
+
+            scale = 1.0f / sqrtf((float)D_HEAD);
+
+            for (i = 0; i < T; i++)
+            {
+                float row[MAX_SEQ];
+
+                for (j = 0; j <= i; j++)
+                {
+                    float s = 0;
+                    for (d = 0; d < D_HEAD; d++)
+                        s += c->q[l][h][i][d]
+                           * c->k[l][h][j][d];
+                    row[j] = s * scale;
+                }
+
+                softmax(row, i + 1);
+
+                for (j = 0; j <= i; j++)
+                    c->p[l][h][i][j] = row[j];
+                for (j = i + 1; j < T; j++)
+                    c->p[l][h][i][j] = 0;
+
+                for (d = 0; d < D_HEAD; d++)
+                {
+                    float ctx = 0;
+                    for (j = 0; j <= i; j++)
+                        ctx += row[j] * c->v[l][h][j][d];
+                    c->cc[l][i][h * D_HEAD + d] = ctx;
+                }
+            }
+        }
+
+        for (i = 0; i < T; i++)
+            for (d = 0; d < D_MODEL; d++)
+            {
+                float o = 0;
+                for (e = 0; e < D_MODEL; e++)
+                    o += m->W_O[l][d][e] * c->cc[l][i][e];
+                X[i][d] += o;
+            }
+
+        memcpy(c->Xb[l], X, sizeof(X));
+
+        for (i = 0; i < T; i++)
+            c->s2[l][i] = rmsnorm(X[i], m->norm2_g[l],
+                                  c->n2[l][i], D_MODEL);
+
+        for (i = 0; i < T; i++)
+        {
+            for (d = 0; d < D_FF; d++)
+            {
+                float a = 0;
+                for (e = 0; e < D_MODEL; e++)
+                    a += m->W_up[l][d][e] * c->n2[l][i][e];
+                c->hf[l][i][d] = a;
+                c->gf[l][i][d] = gelu(a);
+            }
+            for (d = 0; d < D_MODEL; d++)
+            {
+                float o = 0;
+                for (e = 0; e < D_FF; e++)
+                    o += m->W_down[l][d][e] * c->gf[l][i][e];
+                X[i][d] += o;
+            }
+        }
+    }
+
+    memcpy(c->Xc, X, sizeof(X));
+
+    for (i = 0; i < T; i++)
+        c->sf[i] = rmsnorm(X[i], m->norm_f_g, c->Xf[i],
+                           D_MODEL);
+
+    for (i = 0; i < T; i++)
+        for (j = 0; j < VOCAB; j++)
+        {
+            float z = 0;
+            for (d = 0; d < D_MODEL; d++)
+                z += c->Xf[i][d] * m->tok_emb[j][d];
+            c->logit[i][j] = z;
+        }
+}
+
+static float loss_and_backward(const GPT *m, Cache *c, GPT *gr)
+{
+    int i, j, l, h, d, e;
+    int T = c->T;
+    float total = 0;
+    float inv;
+    static float dX[MAX_SEQ][D_MODEL];
+    static float dXf[MAX_SEQ][D_MODEL];
+
+    memset(dX, 0, sizeof(dX));
+    memset(dXf, 0, sizeof(dXf));
+
+    inv = 1.0f / (T - 1);
+
+    for (i = 0; i < T - 1; i++)
+    {
+        float pr[VOCAB];
+        int tgt = c->tok[i + 1];
+
+        memcpy(pr, c->logit[i], sizeof(pr));
+        softmax(pr, VOCAB);
+        total += -logf(pr[tgt] + 1e-9f);
+
+        for (j = 0; j < VOCAB; j++)
+        {
+            float hot = (j == tgt) ? 1.0f : 0.0f;
+            float dz = (pr[j] - hot) * inv;
+            for (d = 0; d < D_MODEL; d++)
+            {
+                gr->tok_emb[j][d] += dz * c->Xf[i][d];
+                dXf[i][d] += dz * m->tok_emb[j][d];
+            }
+        }
+    }
+
+    for (i = 0; i < T; i++)
+        rmsnorm_back(c->Xc[i], m->norm_f_g, c->sf[i],
+                     dXf[i], dX[i], gr->norm_f_g, D_MODEL);
+
+    for (l = N_LAYERS - 1; l >= 0; l--)
+    {
+        float scale;
+        static float dn2[MAX_SEQ][D_MODEL];
+        static float dn1[MAX_SEQ][D_MODEL];
+        static float dcc[MAX_SEQ][D_MODEL];
+
+        memset(dn2, 0, sizeof(dn2));
+        memset(dn1, 0, sizeof(dn1));
+
+        for (i = 0; i < T; i++)
+        {
+            float dg[D_FF];
+            memset(dg, 0, sizeof(dg));
+
+            for (d = 0; d < D_MODEL; d++)
+                for (e = 0; e < D_FF; e++)
+                {
+                    gr->W_down[l][d][e] += dX[i][d]
+                                         * c->gf[l][i][e];
+                    dg[e] += m->W_down[l][d][e] * dX[i][d];
+                }
+
+            for (e = 0; e < D_FF; e++)
+            {
+                float da = dg[e] * gelu_grad(c->hf[l][i][e]);
+                for (d = 0; d < D_MODEL; d++)
+                {
+                    gr->W_up[l][e][d] += da * c->n2[l][i][d];
+                    dn2[i][d] += m->W_up[l][e][d] * da;
+                }
+            }
+        }
+
+        for (i = 0; i < T; i++)
+            rmsnorm_back(c->Xb[l][i], m->norm2_g[l],
+                         c->s2[l][i], dn2[i], dX[i],
+                         gr->norm2_g[l], D_MODEL);
+
+        memset(dcc, 0, sizeof(dcc));
+
+        for (i = 0; i < T; i++)
+            for (d = 0; d < D_MODEL; d++)
+                for (e = 0; e < D_MODEL; e++)
+                {
+                    gr->W_O[l][d][e] += dX[i][d]
+                                      * c->cc[l][i][e];
+                    dcc[i][e] += m->W_O[l][d][e] * dX[i][d];
+                }
+
+        scale = 1.0f / sqrtf((float)D_HEAD);
+
+        for (h = 0; h < N_HEADS; h++)
+        {
+            static float dq[MAX_SEQ][D_HEAD];
+            static float dk[MAX_SEQ][D_HEAD];
+            static float dv[MAX_SEQ][D_HEAD];
+
+            memset(dq, 0, sizeof(dq));
+            memset(dk, 0, sizeof(dk));
+            memset(dv, 0, sizeof(dv));
+
+            for (i = 0; i < T; i++)
+            {
+                float dp[MAX_SEQ];
+                float ds[MAX_SEQ];
+                float dot = 0;
+
+                memset(dp, 0, sizeof(dp));
+
+                for (j = 0; j <= i; j++)
+                {
+                    float acc = 0;
+                    for (d = 0; d < D_HEAD; d++)
+                    {
+                        acc += dcc[i][h * D_HEAD + d]
+                             * c->v[l][h][j][d];
+                        dv[j][d] += c->p[l][h][i][j]
+                                  * dcc[i][h * D_HEAD + d];
+                    }
+                    dp[j] = acc;
+                }
+
+                for (j = 0; j <= i; j++)
+                    dot += c->p[l][h][i][j] * dp[j];
+
+                for (j = 0; j <= i; j++)
+                    ds[j] = c->p[l][h][i][j]
+                          * (dp[j] - dot) * scale;
+
+                for (j = 0; j <= i; j++)
+                    for (d = 0; d < D_HEAD; d++)
+                    {
+                        dq[i][d] += ds[j] * c->k[l][h][j][d];
+                        dk[j][d] += ds[j] * c->q[l][h][i][d];
+                    }
+            }
+
+            for (i = 0; i < T; i++)
+                for (d = 0; d < D_HEAD; d++)
+                    for (e = 0; e < D_MODEL; e++)
+                    {
+                        float u = c->n1[l][i][e];
+                        gr->W_Q[l][h][d][e] += dq[i][d] * u;
+                        gr->W_K[l][h][d][e] += dk[i][d] * u;
+                        gr->W_V[l][h][d][e] += dv[i][d] * u;
+                        dn1[i][e] +=
+                              m->W_Q[l][h][d][e] * dq[i][d]
+                            + m->W_K[l][h][d][e] * dk[i][d]
+                            + m->W_V[l][h][d][e] * dv[i][d];
+                    }
+        }
+
+        for (i = 0; i < T; i++)
+            rmsnorm_back(c->Xa[l][i], m->norm1_g[l],
+                         c->s1[l][i], dn1[i], dX[i],
+                         gr->norm1_g[l], D_MODEL);
+    }
+
+    for (i = 0; i < T; i++)
+        for (d = 0; d < D_MODEL; d++)
+        {
+            gr->tok_emb[c->tok[i]][d] += dX[i][d];
+            gr->pos_emb[i][d] += dX[i][d];
+        }
+
+    return total / (T - 1);
+}
+
+static double loss_only(const GPT *m, const int *tok, int T,
+                        Cache *c)
+{
+    int i;
+    double total = 0;
+
+    forward(m, tok, T, c);
+
+    for (i = 0; i < T - 1; i++)
+    {
+        float pr[VOCAB];
+        memcpy(pr, c->logit[i], sizeof(pr));
+        softmax(pr, VOCAB);
+        total += -logf(pr[c->tok[i + 1]] + 1e-9f);
+    }
+    return total / (T - 1);
+}
+
+/* c1 and c2 hoisted: powf is expensive on soft float. */
+static void adam_step(GPT *m, float lr, int t)
+{
+    float *w = (float *)m, *g = (float *)&Grad;
+    float *u = (float *)&Mom, *v = (float *)&Vel;
+    float b1 = 0.9f, b2 = 0.999f;
+    float c1 = 1.0f - powf(b1, (float)t);
+    float c2 = 1.0f - powf(b2, (float)t);
+    int i;
+
+    for (i = 0; i < (int)NPARAM; i++)
+    {
+        u[i] = b1 * u[i] + (1 - b1) * g[i];
+        v[i] = b2 * v[i] + (1 - b2) * g[i] * g[i];
+        w[i] -= lr * (u[i] / c1)
+              / (sqrtf(v[i] / c2) + 1e-8f);
+    }
+}
+
+/* ---- Gradient check ------------------------------------------------
+ * Perturb a whole block along a random direction and compare the
+ * measured loss change against the analytic gradient projected onto
+ * it. Averaging over a direction removes the float32 noise that
+ * ruins single element checks.
+ * ------------------------------------------------------------------ */
+
+static float dir[NPARAM];
+
+static double check_block(GPT *m, const int *tok, int T,
+                          Cache *c, int lo, int hi,
+                          double *out_num)
+{
+    float *w = (float *)m, *g = (float *)&Grad;
+    double ana = 0, eps = 1e-3, Lp, Lm;
+    int i;
+
+    for (i = lo; i < hi; i++)
+    {
+        dir[i] = randf() * 2 - 1;
+        ana += (double)g[i] * dir[i];
+    }
+
+    for (i = lo; i < hi; i++) w[i] += (float)(eps * dir[i]);
+    Lp = loss_only(m, tok, T, c);
+
+    for (i = lo; i < hi; i++) w[i] -= (float)(2 * eps * dir[i]);
+    Lm = loss_only(m, tok, T, c);
+
+    for (i = lo; i < hi; i++) w[i] += (float)(eps * dir[i]);
+
+    *out_num = (Lp - Lm) / (2 * eps);
+    return ana;
+}
+
+/* ---- RRAM persistence ----------------------------------------------
+ * Written once after training. Never in the loop, RRAM has finite
+ * write endurance and Adam would destroy it.
+ * ------------------------------------------------------------------ */
+
+#define RRAM_CHUNK 1024
+
+static int save_weights(const GPT *m)
+{
+    uint32_t magic = WEIGHTS_MAGIC;
+    const uint8_t *src = (const uint8_t *)m;
+    uint32_t off = 0;
+    uint32_t left = (uint32_t)sizeof(GPT);
+
+    if (rram_write(WEIGHTS_ADDR, (const uint8_t *)&magic,
+                   sizeof(magic)) != 0)
+        return 0;
+
+    while (left > 0)
+    {
+        uint32_t nb = (left > RRAM_CHUNK) ? RRAM_CHUNK : left;
+
+        if (rram_write(WEIGHTS_ADDR + 4 + off, src + off,
+                       nb) != 0)
+            return 0;
+
+        off += nb;
+        left -= nb;
+    }
+    return 1;
+}
+
+static int load_weights(GPT *m)
+{
+    uint32_t magic = 0;
+
+    rram_read(WEIGHTS_ADDR, (uint8_t *)&magic, sizeof(magic));
+
+    if (magic != WEIGHTS_MAGIC) return 0;
+
+    rram_read(WEIGHTS_ADDR + 4, (uint8_t *)m, sizeof(GPT));
+    return 1;
+}
+
+/* ---- Corpus ------------------------------------------------------- */
+
+static const char *corpus =
+    "the cat sat on the mat. "
+    "the dog ran in the park. "
+    "a big cat sat on a big mat. the small dog ran fast. "
+    "the cat and the dog sat on the mat. a cat ran. "
+    "the big dog sat. a small cat ran in the park. "
+    "the dog and the cat ran fast. a big dog sat on a mat. ";
+
+static int tok[512];
+static int n_tok = 0;
+
+static float unigram_entropy(const int *t, int n)
+{
+    int count[VOCAB];
+    float h = 0;
+    int i;
+
+    for (i = 0; i < VOCAB; i++) count[i] = 0;
+    for (i = 0; i < n; i++) count[t[i]]++;
+
+    for (i = 0; i < VOCAB; i++)
+        if (count[i])
+        {
+            float p = (float)count[i] / n;
+            h -= p * logf(p);
+        }
+    return h;
+}
+
+/* ---- Generation --------------------------------------------------- */
+
+static void generate(const char *prompt)
+{
+    int seq[MAX_SEQ];
+    int len = 0;
+    int i;
+
+    while (prompt[len] && len < 8)
+    {
+        seq[len] = char_to_id(prompt[len]);
+        len++;
+    }
+
+    mini_printf("    %s", prompt);
+
+    for (i = 0; i < WINDOW - len; i++)
+    {
+        float pr[VOCAB], r, acc = 0;
+        int pick = VOCAB - 1, j;
+
+        forward(&model, seq, len, &cache);
+
+        for (j = 0; j < VOCAB; j++)
+            pr[j] = cache.logit[len - 1][j] / 0.8f;
+
+        softmax(pr, VOCAB);
+        r = randf();
+
+        for (j = 0; j < VOCAB; j++)
+        {
+            acc += pr[j];
+            if (r < acc)
+            {
+                pick = j;
+                break;
+            }
+        }
+
+        mini_printf("%c", id_to_char(pick));
+        seq[len++] = pick;
+    }
+    mini_printf("\r\n");
+}
+
+/* ---- Stages ------------------------------------------------------- */
+
+enum {
+    ST_GRADCHECK,
+    ST_TRAIN,
+    ST_GENERATE,
+    ST_SAVE,
+    ST_DONE
+};
+
+static int   stage = ST_GRADCHECK;
+static int   epoch = 1;
+static int   step  = 0;
+static int   sidx  = 0;
+static float epoch_loss = 0;
+static int   epoch_batches = 0;
+static uint32_t train_start_ms = 0;
+
+static const char *pnames[] = {
+    "tok_emb", "pos_emb", "W_Q", "W_K", "W_V", "W_O",
+    "W_up", "W_down", "norm1_g", "norm2_g", "norm_f_g"
+};
+
+static const size_t poff[] = {
+    offsetof(GPT, tok_emb),  offsetof(GPT, pos_emb),
+    offsetof(GPT, W_Q),      offsetof(GPT, W_K),
+    offsetof(GPT, W_V),      offsetof(GPT, W_O),
+    offsetof(GPT, W_up),     offsetof(GPT, W_down),
+    offsetof(GPT, norm1_g),  offsetof(GPT, norm2_g),
+    offsetof(GPT, norm_f_g), sizeof(GPT)
+};
+
+static void run_gradcheck(void)
+{
+    double worst = 0;
+    int b;
+
+    memset(&Grad, 0, sizeof(Grad));
+    forward(&model, tok, WINDOW, &cache);
+    loss_and_backward(&model, &cache, &Grad);
+
+    mini_printf("  Gradient check, analytic vs numerical:\r\n");
+    mini_printf("    block        analytic     numerical    err\r\n");
+
+    for (b = 0; b < 11; b++)
+    {
+        double num;
+        double ana = check_block(&model, tok, WINDOW, &cache,
+                                 (int)(poff[b] / sizeof(float)),
+                                 (int)(poff[b + 1] / sizeof(float)),
+                                 &num);
+        double den = fabs(num) + fabs(ana) + 1e-12;
+        double rel = fabs(num - ana) / den;
+
+        if (rel > worst) worst = rel;
+
+        mini_printf("    ");
+        print_pad(pnames[b], 9);
+        mini_printf("  ");
+        print_f((float)ana);
+        mini_printf("  ");
+        print_f((float)num);
+        mini_printf("  ");
+        print_sci((float)rel);
+        mini_printf("\r\n");
+    }
+
+    mini_printf("    worst relative error ");
+    print_sci((float)worst);
+    mini_printf(" against a tolerance of 5e-3,\r\n");
+    mini_printf("    the limit float32 forward passes allow.\r\n");
+    mini_printf("    %s\r\n\r\n",
+                worst < 5e-3 ? "Every gradient agrees."
+                              : "A GRADIENT IS WRONG.");
+
+    /* TODO: swap for SEVS assert macro */
+    if (!(worst < 5e-3))
+    {
+        mini_printf("    Halting: backward pass does not match "
+                    "forward on this hardware.\r\n");
+        stage = ST_DONE;
+        return;
+    }
+
+    memset(&Mom, 0, sizeof(Mom));
+    memset(&Vel, 0, sizeof(Vel));
+
+    mini_printf("  Training all %d parameters:\r\n", (int)NPARAM);
+    train_start_ms = millis();
+    stage = ST_TRAIN;
+}
+
+/* One batch per call. A single blocking 77 minute call looks
+   exactly like a crash. */
+static void run_train_batch(void)
+{
+    uint32_t t0 = millis();
+
+    memset(&Grad, 0, sizeof(Grad));
+    forward(&model, tok + sidx, WINDOW, &cache);
+    epoch_loss += loss_and_backward(&model, &cache, &Grad);
+    adam_step(&model, 0.01f, ++step);
+    epoch_batches++;
+
+    if (epoch == 1 && epoch_batches == 1)
+        mini_printf("    first step took %d ms\r\n",
+                    (int)(millis() - t0));
+
+    sidx += STRIDE;
+
+    if (sidx + WINDOW >= n_tok)
+    {
+        if (epoch == 1 || epoch % 10 == 0)
+        {
+            mini_printf("    epoch ");
+            print_iw(epoch, 3);
+            mini_printf("   loss ");
+            print_f(epoch_loss / epoch_batches);
+            mini_printf("   %d s\r\n",
+                        (int)((millis() - train_start_ms) / 1000));
+        }
+
+        sidx = 0;
+        epoch_loss = 0;
+        epoch_batches = 0;
+        epoch++;
+
+        if (epoch > EPOCHS)
+        {
+            mini_printf("\r\n  Training done in %d s\r\n",
+                        (int)((millis() - train_start_ms) / 1000));
+            stage = ST_GENERATE;
+        }
+    }
+}
+
+/* ---- Entry points ------------------------------------------------- */
+
+void app_init(void)
+{
+    int i;
+    float uni, freq;
+
+    trng_init();
+
+#if DETERMINISTIC_SEED
+    rng_seed(42u);
+#else
+    rng_seed(trng_random());
+#endif
+
+    for (i = 0; corpus[i] && n_tok < 512; i++)
+        tok[n_tok++] = char_to_id(corpus[i]);
+
+    mini_printf("\r\n=== A GPT that trains itself on a "
+                "Baochip-1x ===\r\n\r\n");
+    mini_printf("  vocab %d  d_model %d  heads %d\r\n",
+                VOCAB, D_MODEL, N_HEADS);
+    mini_printf("  d_ff %d  layers %d  seq %d\r\n",
+                D_FF, N_LAYERS, MAX_SEQ);
+    mini_printf("  parameters %d   corpus %d characters\r\n",
+                (int)NPARAM, n_tok);
+    mini_printf("  model %d KB   working set about %d KB\r\n",
+                (int)(sizeof(GPT) / 1024),
+                (int)((4 * sizeof(GPT) + sizeof(Cache)) / 1024));
+
+    uni  = logf((float)VOCAB);
+    freq = unigram_entropy(tok, n_tok);
+
+    mini_printf("  uniform guess scores ");
+    print_f(uni);
+    mini_printf("\r\n  character frequency scores ");
+    print_f(freq);
+    mini_printf("\r\n  anything above that has learned "
+                "nothing.\r\n\r\n");
+
+    if (load_weights(&model))
+    {
+        mini_printf("  Found trained weights in RRAM. "
+                    "Generating without training.\r\n\r\n");
+        generate("the ");
+        generate("a bi");
+        mini_printf("\r\n  Those weights survived a power "
+                    "cycle.\r\n");
+        stage = ST_DONE;
+        return;
+    }
+
+    gpt_init(&model);
+}
+
+void app_run(void)
+{
+    switch (stage)
+    {
+    case ST_GRADCHECK:
+        run_gradcheck();
+        break;
+
+    case ST_TRAIN:
+        run_train_batch();
+        break;
+
+    case ST_GENERATE:
+        mini_printf("\r\n  Generation (temperature 0.8):\r\n");
+        generate("the ");
+        generate("a bi");
+        generate("the ");
+        stage = ST_SAVE;
+        break;
+
+    case ST_SAVE:
+        mini_printf("\r\n  Writing %d KB of weights to RRAM...\r\n",
+                    (int)(sizeof(GPT) / 1024));
+        if (save_weights(&model))
+        {
+            mini_printf("  Saved at 0x%x. Pull the power and "
+                        "plug it back in.\r\n",
+                        (unsigned)WEIGHTS_ADDR);
+        }
+        else
+        {
+            mini_printf("  RRAM write failed.\r\n");
+        }
+        stage = ST_DONE;
+        break;
+
+    case ST_DONE:
+    default:
+        delay(1000);
+        break;
+    }
+}

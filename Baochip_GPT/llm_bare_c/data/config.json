@@ -1,0 +1,8 @@
+{
+  "peripherals": [
+    "GPIO",
+    "RRAM",
+    "TRNG"
+  ],
+  "libraries": []
+}
